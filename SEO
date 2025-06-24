@@ -1,0 +1,156 @@
+import os
+import re
+import json
+import csv
+import time
+import requests
+import numpy as np
+from bs4 import BeautifulSoup
+from datetime import datetime
+from collections import Counter, deque
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from concurrent.futures import ThreadPoolExecutor
+
+# Load embedding model
+bert_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# URLs to skip
+SKIP_PATTERNS = ['login', 'signup', 'privacy', 'terms', 'cart', 'checkout']
+
+# Number of threads to use for faster crawling
+MAX_WORKERS = 10
+
+# Limit max number of pages crawled per site
+MAX_PAGES = 100
+
+def extract_links(base_url, html):
+    soup = BeautifulSoup(html, 'html.parser')
+    links = set()
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        full_url = requests.compat.urljoin(base_url, href)
+        if requests.compat.urlparse(full_url).netloc == requests.compat.urlparse(base_url).netloc:
+            links.add(full_url.split('#')[0])
+    return list(links)
+
+def extract_page_content(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        title = soup.title.string.strip() if soup.title else ""
+
+        for tag in soup(['script', 'style', 'header', 'footer']):
+            tag.decompose()
+
+        text = soup.get_text(separator=' ', strip=True)
+        return url, title, text, response.text
+
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch {url}: {e}")
+        return url, "", "", ""
+
+def get_top_keywords(text, n=5):
+    words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
+    common = Counter(words).most_common(n)
+    return [word for word, _ in common]
+
+def compute_embedding(text):
+    if text:
+        return bert_model.encode(text, convert_to_numpy=True)
+    return np.zeros(384)
+
+def compute_relevance_scores(embedding_matrix):
+    mean_vec = np.mean(embedding_matrix, axis=0)
+    scores = cosine_similarity(embedding_matrix, [mean_vec])[:, 0]
+    return scores
+
+def crawl_entire_site(start_url):
+    visited = set()
+    to_visit = deque([start_url])
+    all_pages = []
+
+    while to_visit and len(visited) < MAX_PAGES:
+        url = to_visit.popleft()
+        if url in visited or any(skip in url.lower() for skip in SKIP_PATTERNS):
+            continue
+        visited.add(url)
+
+        print(f"  → {url}")
+        _, title, text, html = extract_page_content(url)
+        if not text:
+            continue
+
+        word_count = len(re.findall(r'\b\w+\b', text))
+        sentence_count = len(re.findall(r'[.!?]', text))
+        keywords = get_top_keywords(text)
+        emb = compute_embedding(text)
+
+        all_pages.append({
+            "URL": url,
+            "Title": title,
+            "WordCount": word_count,
+            "SentenceCount": sentence_count,
+            "TopKeywords": ", ".join(keywords),
+            "Embedding": json.dumps(emb.tolist()),
+            "EmbeddingVector": emb
+        })
+
+        links = extract_links(start_url, html)
+        for link in links:
+            if link not in visited and all(skip not in link.lower() for skip in SKIP_PATTERNS):
+                to_visit.append(link)
+
+    return all_pages
+
+def save_to_csv(data, filename="web_audit_results.csv"):
+    headers = list(data[0].keys())
+    with open(filename, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in data:
+            writer.writerow(row)
+
+def main():
+    input_file = "input.csv"
+
+    with open(input_file, newline='', encoding='utf-8') as f:
+        base_urls = [row['URL'].strip() for row in csv.DictReader(f)]
+
+    all_results = []
+
+    for base_url in base_urls:
+        print(f"🔍 Crawling entire site: {base_url}...")
+        pages = crawl_entire_site(base_url)
+
+        if pages:
+            embeddings = [np.array(json.loads(p["Embedding"])) for p in pages]
+            relevances = compute_relevance_scores(np.stack(embeddings))
+
+            for i, page in enumerate(pages):
+                result = {
+                    "ParentSite": base_url,
+                    "URL": page["URL"],
+                    "Title": page["Title"],
+                    "WordCount": page["WordCount"],
+                    "SentenceCount": page["SentenceCount"],
+                    "TopKeywords": page["TopKeywords"],
+                    "RelevanceScore": round(relevances[i], 4),
+                    "Embedding": page["Embedding"]
+                }
+                all_results.append(result)
+
+    if all_results:
+        save_to_csv(all_results)
+        print(f"\n✅ Done! Results saved to web_audit_results.csv")
+    else:
+        print("❌ No data collected.")
+
+if __name__ == "__main__":
+    main()
+
