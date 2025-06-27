@@ -70,6 +70,14 @@ def compute_relevance_scores(embedding_matrix):
     scores = cosine_similarity(embedding_matrix, [mean_vec])[:, 0]
     return scores
 
+def compute_duplication_flags(embeddings, threshold=0.95):
+    sim_matrix = cosine_similarity(embeddings)
+    duplicate_flags = []
+    for i in range(len(sim_matrix)):
+        similar_count = sum(sim_matrix[i][j] > threshold for j in range(len(sim_matrix)) if i != j)
+        duplicate_flags.append(similar_count > 0)
+    return duplicate_flags
+
 def crawl_entire_site(start_url):
     visited = set()
     to_visit = deque([start_url])
@@ -108,7 +116,7 @@ def crawl_entire_site(start_url):
 
     return all_pages
 
-def save_to_csv(data, filename="web_audit_results.csv"):
+def save_to_csv(data, filename="web_audit_output.csv"):
     headers = list(data[0].keys())
     with open(filename, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -131,6 +139,7 @@ def main():
         if pages:
             embeddings = [np.array(json.loads(p["Embedding"])) for p in pages]
             relevances = compute_relevance_scores(np.stack(embeddings))
+            duplicates = compute_duplication_flags(np.stack(embeddings))
 
             for i, page in enumerate(pages):
                 result = {
@@ -141,16 +150,16 @@ def main():
                     "SentenceCount": page["SentenceCount"],
                     "TopKeywords": page["TopKeywords"],
                     "RelevanceScore": round(relevances[i], 4),
+                    "IsDuplicate": duplicates[i],
                     "Embedding": page["Embedding"]
                 }
                 all_results.append(result)
 
     if all_results:
         save_to_csv(all_results)
-        print(f"\n✅ Done! Results saved to web_audit_results.csv")
+        print(f"\n Done! Results saved to 'web_audit_output.csv'")
     else:
         print("❌ No data collected.")
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
-
