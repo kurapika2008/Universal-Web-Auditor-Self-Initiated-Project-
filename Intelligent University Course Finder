@@ -1,0 +1,226 @@
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import csv
+from collections import defaultdict
+import re
+
+def is_valid_url(url):
+    """Check if URL is valid"""
+    parsed = urlparse(url)
+    return bool(parsed.netloc) and bool(parsed.scheme)
+
+def is_course_page(url, title):
+    """Check if this is likely a course/program page"""
+    course_keywords = [
+        'course', 'program', 'degree', 'curriculum',
+        'bachelor', 'master', 'b.tech', 'm.tech', 'bsc', 'msc',
+        'admission', 'syllabus', 'module', 'credit'
+    ]
+    url_lower = url.lower()
+    title_lower = title.lower()
+    return any(keyword in url_lower or keyword in title_lower 
+              for keyword in course_keywords)
+
+def get_website_links(url, max_depth=2, max_pages=50):
+    """Smart crawler that prioritizes academic sections"""
+    visited = set()
+    to_visit = [(url, 0)]
+    base_domain = urlparse(url).netloc
+    
+    academic_sections = [
+        'academics', 'programs', 'courses', 'admissions',
+        'school', 'faculty', 'department', 'study'
+    ]
+    
+    while to_visit and len(visited) < max_pages:
+        current_url, depth = to_visit.pop(0)
+        
+        if current_url in visited or depth > max_depth:
+            continue
+            
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(current_url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            visited.add(current_url)
+            
+            if depth < max_depth:
+                links = []
+                for link in soup.find_all('a', href=True):
+                    href = link['href'].strip()
+                    if href.startswith(('javascript:', 'mailto:', 'tel:')):
+                        continue
+                        
+                    absolute_url = urljoin(current_url, href)
+                    parsed = urlparse(absolute_url)
+                    clean_url = parsed._replace(fragment="").geturl()
+                    
+                    if not is_valid_url(clean_url):
+                        continue
+                        
+                    if parsed.netloc != base_domain:
+                        continue
+                        
+                    # Prioritize academic links
+                    priority = 0
+                    path = parsed.path.lower()
+                    if any(section in path for section in academic_sections):
+                        priority = 2
+                    elif is_course_page(clean_url, link.text):
+                        priority = 3
+                    else:
+                        priority = 1
+                        
+                    links.append((clean_url, priority))
+                
+                # Sort links by academic priority
+                links.sort(key=lambda x: -x[1])
+                to_visit.extend([(url, depth + 1) for url, _ in links[:20]])
+                
+        except Exception as e:
+            print(f"Error crawling {current_url}: {e}")
+            
+    return visited
+
+def extract_course_details(url):
+    """Extract structured course information"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove clutter
+        for element in soup(['script', 'style', 'header', 'footer', 'nav']):
+            element.decompose()
+            
+        # Get basic info
+        title = soup.title.text.strip() if soup.title else "No Title"
+        text = soup.get_text(separator=' ', strip=True)
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Try to extract structured course data
+        course_info = {
+            'title': title,
+            'degree_level': '',
+            'department': '',
+            'duration': '',
+            'description': text[:500] + '...' if len(text) > 500 else text
+        }
+        
+        # Detect degree level
+        title_lower = title.lower()
+        if 'bachelor' in title_lower or 'b.' in title_lower:
+            course_info['degree_level'] = 'Undergraduate'
+        elif 'master' in title_lower or 'm.' in title_lower:
+            course_info['degree_level'] = 'Postgraduate'
+        elif 'phd' in title_lower or 'doctorate' in title_lower:
+            course_info['degree_level'] = 'Doctoral'
+            
+        return course_info
+        
+    except Exception as e:
+        print(f"Error processing {url}: {e}")
+        return None
+
+def get_keywords_from_user():
+    """Get search keywords from user"""
+    print("\nWhat courses are you looking for?")
+    print("Enter keywords like 'AI', 'Computer Science', 'MBA' etc.")
+    print("Type 'done' when finished.\n")
+    
+    keywords = set()
+    while True:
+        kw = input("Add a keyword: ").strip()
+        if kw.lower() in ['done', 'stop', '']:
+            break
+        if kw:
+            keywords.add(kw.lower())
+            
+    return list(keywords)
+
+def analyze_courses(website_urls, keywords):
+    """Find courses matching keywords"""
+    results = []
+    
+    for uni_url in website_urls:
+        print(f"\n🔍 Searching {uni_url} for courses...")
+        pages = get_website_links(uni_url)
+        
+        for page_url in pages:
+            course_info = extract_course_details(page_url)
+            if not course_info:
+                continue
+                
+            if not is_course_page(page_url, course_info['title']):
+                continue
+                
+            # Check for keyword matches
+            content = f"{course_info['title']} {course_info['description']}".lower()
+            matches = [kw for kw in keywords if kw in content]
+            
+            if matches:
+                result = {
+                    'university': uni_url,
+                    'course_page': page_url,
+                    'course_title': course_info['title'],
+                    'degree_level': course_info['degree_level'],
+                    'matched_keywords': ', '.join(matches),
+                    'description_snippet': course_info['description']
+                }
+                results.append(result)
+    
+    # Sort by most keyword matches
+    results.sort(key=lambda x: (-len(x['matched_keywords'].split(',')), x['course_title']))
+    return results
+
+def save_to_csv(results, filename='courses.csv'):
+    """Save results to CSV"""
+    if not results:
+        print("No courses found matching your criteria.")
+        return
+        
+    fields = ['university', 'course_page', 'course_title', 
+              'degree_level', 'matched_keywords', 'description_snippet']
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\n✅ Found {len(results)} courses! Saved to {filename}")
+
+def main():
+    print("🎓 UNIVERSITY COURSE FINDER 🎓")
+    print("This tool searches university websites for courses matching your keywords\n")
+    
+    # Get university URLs
+    print("Enter university website URLs (one per line, type 'done' when finished):")
+    uni_urls = []
+    while True:
+        url = input("> ").strip()
+        if url.lower() in ['done', '']:
+            break
+        if is_valid_url(url):
+            uni_urls.append(url)
+        else:
+            print("Invalid URL, try again")
+
+    if not uni_urls:
+        print("No universities to search!")
+        return
+        
+    # Get keywords
+    keywords = get_keywords_from_user()
+    if not keywords:
+    
+        print("No keywords entered!")
+        return
+    
+    # Search and save results
+    results = analyze_courses(uni_urls, keywords)
+    save_to_csv(results)
+    
+    print("\nSearch complete! Open courses.csv to see your results.")
+
+if __name__ == "__main__":
+    main()
